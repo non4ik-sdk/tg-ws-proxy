@@ -4,19 +4,21 @@ import ctypes
 import json
 import logging
 import os
-import psutil
 import sys
 import threading
 import time
-import webbrowser
 import asyncio
 import pystray
 import asyncio as _asyncio
 import customtkinter as ctk
+import clipboard
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Mapping
+from typing import Optional, Tuple, Mapping
 from PIL import Image
 
+from utils.Message import show_error, show_info
+from utils.Checks import is_already_running
+from utils.TgHandlers import open_tg_url
 import proxy.tg_ws_proxy as tg_ws_proxy
 
 
@@ -42,15 +44,6 @@ _exiting: bool = False
 
 log = logging.getLogger("tg-ws-tray")
 
-def is_already_running():
-    current_proc = os.path.basename(sys.argv[0])
-    count = 0
-    for process in psutil.process_iter(['name']):
-        if process.info['name'] == current_proc:
-            count += 1
-    return count > 2
-
-
 def _ensure_dirs():
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +54,6 @@ def load_config() -> dict:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Merge with defaults for missing keys
             for k, v in DEFAULT_CONFIG.items():
                 data.setdefault(k, v)
             return data
@@ -125,11 +117,11 @@ def start_proxy():
     verbose = cfg.get("verbose", False)
 
     try:
-        dc_opt = {k: v for k, v in tg_ws_proxy.parse_dc_ip_list(dc_ip_list).items()}  # v имеет тип str
-        dc_opt: Mapping[int, Optional[str]] = dc_opt  # приведение к нужному типу
+        dc_opt = {k: v for k, v in tg_ws_proxy.parse_dc_ip_list(dc_ip_list).items()}  
+        dc_opt: Mapping[int, Optional[str]] = dc_opt  
     except ValueError as e:
         log.error("Bad config dc_ip: %s", e)
-        _show_error(f"Ошибка конфигурации:\n{e}")
+        show_error(f"Ошибка конфигурации:\n{e}")
         return
 
     log.info("Starting proxy on port %d ...", port)
@@ -157,54 +149,29 @@ def restart_proxy():
     time.sleep(0.3)
     start_proxy()
 
-
-def _show_error(text: str, title: str = "TG WS Proxy — Ошибка"):
-    ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
-
-
-def _show_info(text: str, title: str = "TG WS Proxy"):
-    ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
-
-
-def _on_open_in_telegram(icon=None, item=None):
+def on_open_in_tg() -> None:
     port = _config.get("port", DEFAULT_CONFIG["port"])
     url = f"tg://socks?server=127.0.0.1&port={port}"
+
     log.info("Opening %s", url)
+
     try:
-        result = webbrowser.open(url)
-        if not result:
-            raise RuntimeError("webbrowser.open returned False")
-    except Exception:
-        log.info("Browser open failed, copying to clipboard")
-        try:
-            _copy_to_clipboard(url)
-            _show_info(
-                f"Не удалось открыть Telegram автоматически.\n\n"
-                f"Ссылка скопирована в буфер обмена, отправьте её в телеграмм и нажмите по ней ЛКМ:\n{url}",
-                "TG WS Proxy")
-        except Exception as exc:
-            log.error("Clipboard copy failed: %s", exc)
-            _show_error(f"Не удалось скопировать ссылку:\n{exc}")
+        open_tg_url(url)
+        return
+    except Exception as exc:
+        log.info("ShellExecute failed: %s", exc)
 
-
-def _copy_to_clipboard(text: str):
-    """Copy text to Windows clipboard using ctypes."""
-    import ctypes.wintypes
-    CF_UNICODETEXT = 13
-    kernel32 = ctypes.windll.kernel32
-    user32 = ctypes.windll.user32
-
-    user32.OpenClipboard(0)
-    user32.EmptyClipboard()
-
-    encoded = text.encode("utf-16-le") + b"\x00\x00"
-    h = kernel32.GlobalAlloc(0x0042, len(encoded))  # GMEM_MOVEABLE | GMEM_ZEROINIT
-    p = kernel32.GlobalLock(h)
-    ctypes.memmove(p, encoded, len(encoded))
-    kernel32.GlobalUnlock(h)
-    user32.SetClipboardData(CF_UNICODETEXT, h)
-    user32.CloseClipboard()
-
+    try:
+        clipboard.copy(url)
+        show_info(
+            "Не удалось открыть Telegram автоматически.\n\n"
+            "Ссылка скопирована в буфер обмена, отправьте её в Telegram и нажмите по ней:\n"
+            f"{url}",
+            "TG WS Proxy"
+        )
+    except Exception as exc:
+        log.error("Clipboard copy failed: %s", exc)
+        show_error(f"Не удалось скопировать ссылку:\n{exc}")
 
 def _on_restart(icon=None, item=None):
     threading.Thread(target=restart_proxy, daemon=True).start()
@@ -217,7 +184,7 @@ def _on_edit_config(icon=None, item=None):
 
 def _edit_config_dialog():
     if ctk is None:
-        _show_error("customtkinter не установлен.")
+        show_error("customtkinter не установлен.")
         return
 
     cfg = dict(_config)
@@ -249,40 +216,84 @@ def _edit_config_dialog():
     frame.pack(fill="both", expand=True, padx=24, pady=20)
 
     # Port
-    ctk.CTkLabel(frame, text="Порт прокси",
-                 font=(FONT_FAMILY, 13), text_color=TEXT_PRIMARY,
-                 anchor="w").pack(anchor="w", pady=(0, 4))
+    ctk.CTkLabel(
+        frame, 
+        text="Порт прокси",
+        font=(FONT_FAMILY, 13), 
+        text_color=TEXT_PRIMARY,
+        anchor="w"
+    ).pack(
+        anchor="w", 
+        pady=(0, 4)
+    )
     port_var = ctk.StringVar(value=str(cfg.get("port", 1080)))
-    port_entry = ctk.CTkEntry(frame, textvariable=port_var, width=120, height=36,
-                              font=(FONT_FAMILY, 13), corner_radius=10,
-                              fg_color=FIELD_BG, border_color=FIELD_BORDER,
-                              border_width=1, text_color=TEXT_PRIMARY)
+    port_entry = ctk.CTkEntry(
+        frame, 
+        textvariable=port_var, 
+        width=120, 
+        height=36,
+        font=(FONT_FAMILY, 13), 
+        corner_radius=10,
+        fg_color=FIELD_BG, 
+        border_color=FIELD_BORDER,
+        border_width=1, 
+        text_color=TEXT_PRIMARY
+    )
     port_entry.pack(anchor="w", pady=(0, 12))
 
     # DC-IP mappings
-    ctk.CTkLabel(frame, text="DC → IP маппинги (по одному на строку, формат DC:IP)",
-                 font=(FONT_FAMILY, 13), text_color=TEXT_PRIMARY,
-                 anchor="w").pack(anchor="w", pady=(0, 4))
-    dc_textbox = ctk.CTkTextbox(frame, width=370, height=120,
-                                font=("Consolas", 12), corner_radius=10,
-                                fg_color=FIELD_BG, border_color=FIELD_BORDER,
-                                border_width=1, text_color=TEXT_PRIMARY)
+    ctk.CTkLabel(
+        frame, 
+        text="DC → IP маппинги (по одному на строку, формат DC:IP)",
+        font=(FONT_FAMILY, 13), 
+        text_color=TEXT_PRIMARY,
+        anchor="w").pack(
+            anchor="w", 
+            pady=(0, 4)
+        )
+    dc_textbox = ctk.CTkTextbox(
+        frame, 
+        width=370, 
+        height=120,
+        font=("Consolas", 12), 
+        corner_radius=10,
+        fg_color=FIELD_BG, 
+        border_color=FIELD_BORDER,
+        border_width=1, 
+        text_color=TEXT_PRIMARY
+    )
     dc_textbox.pack(anchor="w", pady=(0, 12))
     dc_textbox.insert("1.0", "\n".join(cfg.get("dc_ip", DEFAULT_CONFIG["dc_ip"])))
 
     # Verbose
     verbose_var = ctk.BooleanVar(value=cfg.get("verbose", False))
-    ctk.CTkCheckBox(frame, text="Подробное логирование (verbose)",
-                    variable=verbose_var, font=(FONT_FAMILY, 13),
-                    text_color=TEXT_PRIMARY,
-                    fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
-                    corner_radius=6, border_width=2,
-                    border_color=FIELD_BORDER).pack(anchor="w", pady=(0, 8))
+    ctk.CTkCheckBox(
+        frame, 
+        text="Подробное логирование (verbose)",
+        variable=verbose_var, 
+        font=(FONT_FAMILY, 13),
+        text_color=TEXT_PRIMARY,
+        fg_color=TG_BLUE, 
+        hover_color=TG_BLUE_HOVER,
+        corner_radius=6, 
+        border_width=2,
+        border_color=FIELD_BORDER
+        ).pack(
+            anchor="w", 
+            pady=(0, 8)
+    )
 
     # Info label
-    ctk.CTkLabel(frame, text="Изменения вступят в силу после перезапуска прокси.",
-                 font=(FONT_FAMILY, 11), text_color=TEXT_SECONDARY,
-                 anchor="w").pack(anchor="w", pady=(0, 16))
+    ctk.CTkLabel(
+        frame, 
+        text="Изменения вступят в силу после перезапуска прокси.",
+        font=(FONT_FAMILY, 11), 
+        text_color=TEXT_SECONDARY,
+        anchor="w"
+    ).pack(
+        anchor="w", 
+        pady=(0, 16)
+    )
 
     def on_save():
         try:
@@ -290,7 +301,7 @@ def _edit_config_dialog():
             if not (1 <= port_val <= 65535):
                 raise ValueError
         except ValueError:
-            _show_error("Порт должен быть числом 1-65535")
+            show_error("Порт должен быть числом 1-65535")
             return
 
         lines = [l.strip() for l in dc_textbox.get("1.0", "end").strip().splitlines()
@@ -298,7 +309,7 @@ def _edit_config_dialog():
         try:
             tg_ws_proxy.parse_dc_ip_list(lines)
         except ValueError as e:
-            _show_error(str(e))
+            show_error(str(e))
             return
 
         new_cfg = {
@@ -311,10 +322,12 @@ def _edit_config_dialog():
         log.info("Config saved: %s", new_cfg)
 
         from tkinter import messagebox
-        if messagebox.askyesno("Перезапустить?",
-                               "Настройки сохранены.\n\n"
-                               "Перезапустить прокси сейчас?",
-                               parent=root):
+        if messagebox.askyesno(
+                "Перезапустить?",
+                "Настройки сохранены.\n\n"
+                "Перезапустить прокси сейчас?",
+                parent=root
+            ):
             root.destroy()
             restart_proxy()
         else:
@@ -325,17 +338,37 @@ def _edit_config_dialog():
 
     btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
     btn_frame.pack(fill="x")
-    ctk.CTkButton(btn_frame, text="Сохранить", width=140, height=38,
-                  font=(FONT_FAMILY, 14, "bold"), corner_radius=10,
-                  fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
-                  text_color="#ffffff",
-                  command=on_save).pack(side="left", padx=(0, 10))
-    ctk.CTkButton(btn_frame, text="Отмена", width=140, height=38,
-                  font=(FONT_FAMILY, 14), corner_radius=10,
-                  fg_color=FIELD_BG, hover_color=FIELD_BORDER,
-                  text_color=TEXT_PRIMARY, border_width=1,
-                  border_color=FIELD_BORDER,
-                  command=on_cancel).pack(side="left")
+    ctk.CTkButton(
+        btn_frame, 
+        text="Сохранить", 
+        width=140, 
+        height=38,
+        font=(FONT_FAMILY, 14, "bold"), 
+        corner_radius=10,
+        fg_color=TG_BLUE, 
+        hover_color=TG_BLUE_HOVER,
+        text_color="#ffffff",
+        command=on_save
+    ).pack(
+        side="left",
+        padx=(0, 10)
+    )
+    ctk.CTkButton(
+        btn_frame, 
+        text="Отмена", 
+        width=140, 
+        height=38,
+        font=(FONT_FAMILY, 14), 
+        corner_radius=10,
+        fg_color=FIELD_BG, 
+        hover_color=FIELD_BORDER,
+        text_color=TEXT_PRIMARY, 
+        border_width=1,
+        border_color=FIELD_BORDER,
+        command=on_cancel
+        ).pack(
+            side="left"
+        )
 
     root.mainloop()
 
@@ -345,7 +378,7 @@ def _on_open_logs(icon=None, item=None):
     if LOG_FILE.exists():
         os.startfile(str(LOG_FILE))
     else:
-        _show_info("Файл логов ещё не создан.", "TG WS Proxy")
+        show_info("Файл логов ещё не создан.", "TG WS Proxy")
 
 
 def _on_exit(icon=None, item=None):
@@ -384,10 +417,10 @@ def _show_first_run():
     TG_BLUE = "#3390ec"
     TG_BLUE_HOVER = "#2b7cd4"
     BG = "#ffffff"
-    FIELD_BG = "#f0f2f5"
+    #FIELD_BG = "#f0f2f5"
     FIELD_BORDER = "#d6d9dc"
     TEXT_PRIMARY = "#000000"
-    TEXT_SECONDARY = "#707579"
+    #TEXT_SECONDARY = "#707579"
     FONT_FAMILY = "Segoe UI"
 
     root = ctk.CTk()
@@ -429,39 +462,71 @@ def _show_first_run():
 
     for text, bold in sections:
         weight = "bold" if bold else "normal"
-        ctk.CTkLabel(frame, text=text,
-                     font=(FONT_FAMILY, 13, weight),
-                     text_color=TEXT_PRIMARY,
-                     anchor="w", justify="left").pack(anchor="w", pady=1)
+        ctk.CTkLabel(
+            frame, 
+            text=text,
+            font=(FONT_FAMILY, 13, weight),
+            text_color=TEXT_PRIMARY,
+            anchor="w", 
+            justify="left"
+        ).pack(
+            anchor="w", 
+            pady=1
+        )
 
     # Spacer
     ctk.CTkFrame(frame, fg_color="transparent", height=16).pack()
 
     # Separator
-    ctk.CTkFrame(frame, fg_color=FIELD_BORDER, height=1,
-                 corner_radius=0).pack(fill="x", pady=(0, 12))
+    ctk.CTkFrame(
+        frame, 
+        fg_color=FIELD_BORDER, 
+        height=1,
+        corner_radius=0
+    ).pack(
+        fill="x", 
+        pady=(0, 12)
+    )
 
     # Checkbox
     auto_var = ctk.BooleanVar(value=True)
-    ctk.CTkCheckBox(frame, text="Открыть прокси в Telegram сейчас",
-                    variable=auto_var, font=(FONT_FAMILY, 13),
-                    text_color=TEXT_PRIMARY,
-                    fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
-                    corner_radius=6, border_width=2,
-                    border_color=FIELD_BORDER).pack(anchor="w", pady=(0, 16))
+    ctk.CTkCheckBox(
+        frame, 
+        text="Открыть прокси в Telegram сейчас",
+        variable=auto_var, 
+        font=(FONT_FAMILY, 13),
+        text_color=TEXT_PRIMARY,
+        fg_color=TG_BLUE, 
+        hover_color=TG_BLUE_HOVER,
+        corner_radius=6, 
+        border_width=2,
+        border_color=FIELD_BORDER
+    ).pack(
+        anchor="w", 
+        pady=(0, 16)
+    )
 
     def on_ok():
         FIRST_RUN_MARKER.touch()
         open_tg = auto_var.get()
         root.destroy()
         if open_tg:
-            _on_open_in_telegram()
+            on_open_in_tg()
 
-    ctk.CTkButton(frame, text="Начать", width=180, height=42,
-                  font=(FONT_FAMILY, 15, "bold"), corner_radius=10,
-                  fg_color=TG_BLUE, hover_color=TG_BLUE_HOVER,
-                  text_color="#ffffff",
-                  command=on_ok).pack(pady=(0, 0))
+    ctk.CTkButton(
+        frame, 
+        text="Начать", 
+        width=180, 
+        height=42,
+        font=(FONT_FAMILY, 15, "bold"), 
+        corner_radius=10,
+        fg_color=TG_BLUE, 
+        hover_color=TG_BLUE_HOVER,
+        text_color="#ffffff",
+        command=on_ok
+    ).pack(
+        pady=(0, 0)
+    )
 
     root.protocol("WM_DELETE_WINDOW", on_ok)
     root.mainloop()
@@ -474,7 +539,7 @@ def _build_menu():
     return pystray.Menu(
         pystray.MenuItem(
             f"Открыть в Telegram (:{port})",
-            _on_open_in_telegram,
+            on_open_in_tg,
             default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Перезапустить прокси", _on_restart),
@@ -521,9 +586,9 @@ def run_tray():
     icon_image = Image.open(icon_path)  
 
     _tray_icon = pystray.Icon(
-        "TgWsProxy",
-        icon_image,
-        "TG WS Proxy",
+        name="TgWsProxy",
+        icon=icon_image,
+        title="TG WS Proxy",
         menu=_build_menu()
     )
 
@@ -536,7 +601,7 @@ def run_tray():
 
 def main():
     if is_already_running():
-        _show_info("Приложение уже запущено.", os.path.basename(sys.argv[0]))
+        show_info("Приложение уже запущено.", os.path.basename(sys.argv[0]))
         return
 
     if getattr(sys, "frozen", False):
