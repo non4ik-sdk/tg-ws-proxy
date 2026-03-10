@@ -9,13 +9,13 @@ import sys
 import threading
 import time
 import webbrowser
+import asyncio
 import pystray
-import pyperclip
 import asyncio as _asyncio
 import customtkinter as ctk
 from pathlib import Path
-from typing import Dict, Optional
-from PIL import Image, ImageDraw, ImageFont
+from typing import Dict, Optional, Tuple, Mapping
+from PIL import Image
 
 import proxy.tg_ws_proxy as tg_ws_proxy
 
@@ -29,42 +29,26 @@ FIRST_RUN_MARKER = APP_DIR / ".first_run_done"
 
 DEFAULT_CONFIG = {
     "port": 1080,
-    "host": "127.0.0.1",
     "dc_ip": ["2:149.154.167.220", "4:149.154.167.220"],
     "verbose": False,
 }
 
 
 _proxy_thread: Optional[threading.Thread] = None
-_async_stop: Optional[object] = None
+_async_stop: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = None
 _tray_icon: Optional[object] = None
 _config: dict = {}
 _exiting: bool = False
 
 log = logging.getLogger("tg-ws-tray")
 
-
-def _acquire_lock() -> bool:
-    _ensure_dirs()
-    lock_files = list(APP_DIR.glob("*.lock"))
-        
-    for f in lock_files:
-        try:
-            pid = int(f.stem)
-            if psutil.pid_exists(pid):
-                try:
-                    psutil.Process(pid).status()
-                    return False
-                except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                    pass
-        except Exception:
-            pass
-
-        f.unlink(missing_ok=True)
-
-    lock_file = APP_DIR / f"{os.getpid()}.lock"
-    lock_file.touch()
-    return True
+def is_already_running():
+    current_proc = os.path.basename(sys.argv[0])
+    count = 0
+    for process in psutil.process_iter(['name']):
+        if process.info['name'] == current_proc:
+            count += 1
+    return count > 2
 
 
 def _ensure_dirs():
@@ -77,13 +61,13 @@ def load_config() -> dict:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # Merge with defaults for missing keys
             for k, v in DEFAULT_CONFIG.items():
                 data.setdefault(k, v)
             return data
         except Exception as exc:
             log.warning("Failed to load config: %s", exc)
     return dict(DEFAULT_CONFIG)
-
 
 def save_config(cfg: dict):
     _ensure_dirs()
@@ -111,43 +95,8 @@ def setup_logging(verbose: bool = False):
             datefmt="%H:%M:%S"))
         root.addHandler(ch)
 
-
-def _make_icon_image(size: int = 64):
-    if Image is None:
-        raise RuntimeError("Pillow is required for tray icon")
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    
-    margin = 2
-    draw.ellipse([margin, margin, size - margin, size - margin],
-                 fill=(0, 136, 204, 255))
-                 
-    try:
-        font = ImageFont.truetype("arial.ttf", size=int(size * 0.55))
-    except Exception:
-        font = ImageFont.load_default()
-    bbox = draw.textbbox((0, 0), "T", font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    tx = (size - tw) // 2 - bbox[0]
-    ty = (size - th) // 2 - bbox[1]
-    draw.text((tx, ty), "T", fill=(255, 255, 255, 255), font=font)
-
-    return img
-
-
-def _load_icon():
-    icon_path = Path(__file__).parent / "icon.ico"
-    if icon_path.exists() and Image:
-        try:
-            return Image.open(str(icon_path))
-        except Exception:
-            pass
-    return _make_icon_image()
-
-
-
-def _run_proxy_thread(port: int, dc_opt: Dict[int, str], verbose: bool,
-                      host: str = '127.0.0.1'):
+def _run_proxy_thread(port: int, dc_opt, verbose: bool):
+    """Target for the proxy thread — runs asyncio event loop."""
     global _async_stop
     loop = _asyncio.new_event_loop()
     _asyncio.set_event_loop(loop)
@@ -156,11 +105,9 @@ def _run_proxy_thread(port: int, dc_opt: Dict[int, str], verbose: bool,
 
     try:
         loop.run_until_complete(
-            tg_ws_proxy._run(port, dc_opt, stop_event=stop_ev, host=host))
+            tg_ws_proxy._run(port, dc_opt, stop_event=stop_ev))
     except Exception as exc:
         log.error("Proxy thread crashed: %s", exc)
-        if "10048" in str(exc) or "Address already in use" in str(exc):
-            _show_error("Не удалось запустить прокси:\nПорт уже используется другим приложением.\n\nЗакройте приложение, использующее этот порт, или измените порт в настройках прокси и перезапустите.")
     finally:
         loop.close()
         _async_stop = None
@@ -174,21 +121,21 @@ def start_proxy():
 
     cfg = _config
     port = cfg.get("port", DEFAULT_CONFIG["port"])
-    host = cfg.get("host", DEFAULT_CONFIG["host"])
     dc_ip_list = cfg.get("dc_ip", DEFAULT_CONFIG["dc_ip"])
     verbose = cfg.get("verbose", False)
 
     try:
-        dc_opt = tg_ws_proxy.parse_dc_ip_list(dc_ip_list)
+        dc_opt = {k: v for k, v in tg_ws_proxy.parse_dc_ip_list(dc_ip_list).items()}  # v имеет тип str
+        dc_opt: Mapping[int, Optional[str]] = dc_opt  # приведение к нужному типу
     except ValueError as e:
         log.error("Bad config dc_ip: %s", e)
         _show_error(f"Ошибка конфигурации:\n{e}")
         return
 
-    log.info("Starting proxy on %s:%d ...", host, port)
+    log.info("Starting proxy on port %d ...", port)
     _proxy_thread = threading.Thread(
         target=_run_proxy_thread,
-        args=(port, dc_opt, verbose, host),
+        args=(port, dc_opt, verbose),
         daemon=True, name="proxy")
     _proxy_thread.start()
 
@@ -220,9 +167,8 @@ def _show_info(text: str, title: str = "TG WS Proxy"):
 
 
 def _on_open_in_telegram(icon=None, item=None):
-    host = _config.get("host", DEFAULT_CONFIG["host"])
     port = _config.get("port", DEFAULT_CONFIG["port"])
-    url = f"tg://socks?server={host}&port={port}"
+    url = f"tg://socks?server=127.0.0.1&port={port}"
     log.info("Opening %s", url)
     try:
         result = webbrowser.open(url)
@@ -231,7 +177,7 @@ def _on_open_in_telegram(icon=None, item=None):
     except Exception:
         log.info("Browser open failed, copying to clipboard")
         try:
-            pyperclip.copy(url)
+            _copy_to_clipboard(url)
             _show_info(
                 f"Не удалось открыть Telegram автоматически.\n\n"
                 f"Ссылка скопирована в буфер обмена, отправьте её в телеграмм и нажмите по ней ЛКМ:\n{url}",
@@ -241,11 +187,31 @@ def _on_open_in_telegram(icon=None, item=None):
             _show_error(f"Не удалось скопировать ссылку:\n{exc}")
 
 
+def _copy_to_clipboard(text: str):
+    """Copy text to Windows clipboard using ctypes."""
+    import ctypes.wintypes
+    CF_UNICODETEXT = 13
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+
+    user32.OpenClipboard(0)
+    user32.EmptyClipboard()
+
+    encoded = text.encode("utf-16-le") + b"\x00\x00"
+    h = kernel32.GlobalAlloc(0x0042, len(encoded))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+    p = kernel32.GlobalLock(h)
+    ctypes.memmove(p, encoded, len(encoded))
+    kernel32.GlobalUnlock(h)
+    user32.SetClipboardData(CF_UNICODETEXT, h)
+    user32.CloseClipboard()
+
+
 def _on_restart(icon=None, item=None):
     threading.Thread(target=restart_proxy, daemon=True).start()
 
 
 def _on_edit_config(icon=None, item=None):
+    """Open a simple dialog to edit config."""
     threading.Thread(target=_edit_config_dialog, daemon=True).start()
 
 
@@ -273,7 +239,7 @@ def _edit_config_dialog():
     TEXT_SECONDARY = "#707579"
     FONT_FAMILY = "Segoe UI"
 
-    w, h = 420, 480
+    w, h = 420, 400
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
@@ -281,17 +247,6 @@ def _edit_config_dialog():
 
     frame = ctk.CTkFrame(root, fg_color=BG, corner_radius=0)
     frame.pack(fill="both", expand=True, padx=24, pady=20)
-
-    # Host
-    ctk.CTkLabel(frame, text="IP-адрес прокси",
-                 font=(FONT_FAMILY, 13), text_color=TEXT_PRIMARY,
-                 anchor="w").pack(anchor="w", pady=(0, 4))
-    host_var = ctk.StringVar(value=cfg.get("host", "127.0.0.1"))
-    host_entry = ctk.CTkEntry(frame, textvariable=host_var, width=200, height=36,
-                              font=(FONT_FAMILY, 13), corner_radius=10,
-                              fg_color=FIELD_BG, border_color=FIELD_BORDER,
-                              border_width=1, text_color=TEXT_PRIMARY)
-    host_entry.pack(anchor="w", pady=(0, 12))
 
     # Port
     ctk.CTkLabel(frame, text="Порт прокси",
@@ -330,14 +285,6 @@ def _edit_config_dialog():
                  anchor="w").pack(anchor="w", pady=(0, 16))
 
     def on_save():
-        import socket as _sock
-        host_val = host_var.get().strip()
-        try:
-            _sock.inet_aton(host_val)
-        except OSError:
-            _show_error("Некорректный IP-адрес.")
-            return
-
         try:
             port_val = int(port_var.get().strip())
             if not (1 <= port_val <= 65535):
@@ -355,7 +302,6 @@ def _edit_config_dialog():
             return
 
         new_cfg = {
-            "host": host_val,
             "port": port_val,
             "dc_ip": lines,
             "verbose": verbose_var.get(),
@@ -363,8 +309,6 @@ def _edit_config_dialog():
         save_config(new_cfg)
         _config.update(new_cfg)
         log.info("Config saved: %s", new_cfg)
-
-        _tray_icon.menu = _build_menu()
 
         from tkinter import messagebox
         if messagebox.askyesno("Перезапустить?",
@@ -427,9 +371,8 @@ def _show_first_run():
     if FIRST_RUN_MARKER.exists():
         return
 
-    host = _config.get("host", DEFAULT_CONFIG["host"])
     port = _config.get("port", DEFAULT_CONFIG["port"])
-    tg_url = f"tg://socks?server={host}&port={port}"
+    tg_url = f"tg://socks?server=127.0.0.1&port={port}"
 
     if ctk is None:
         FIRST_RUN_MARKER.touch()
@@ -481,7 +424,7 @@ def _show_first_run():
         (f"  Или ссылка: {tg_url}", False),
         ("\n  Вручную:", True),
         ("  Настройки → Продвинутые → Тип подключения → Прокси", False),
-        (f"  SOCKS5 → {host} : {port} (без логина/пароля)", False),
+        (f"  SOCKS5 → 127.0.0.1 : {port} (без логина/пароля)", False),
     ]
 
     for text, bold in sections:
@@ -527,11 +470,10 @@ def _show_first_run():
 def _build_menu():
     if pystray is None:
         return None
-    host = _config.get("host", DEFAULT_CONFIG["host"])
     port = _config.get("port", DEFAULT_CONFIG["port"])
     return pystray.Menu(
         pystray.MenuItem(
-            f"Открыть в Telegram ({host}:{port})",
+            f"Открыть в Telegram (:{port})",
             _on_open_in_telegram,
             default=True),
         pystray.Menu.SEPARATOR,
@@ -560,7 +502,7 @@ def run_tray():
     log.info("Config: %s", _config)
     log.info("Log file: %s", LOG_FILE)
 
-    if pystray is None or Image is None:
+    if pystray is None:
         log.error("pystray or Pillow not installed; "
                   "running in console mode")
         start_proxy()
@@ -575,12 +517,15 @@ def run_tray():
 
     _show_first_run()
 
-    icon_image = _load_icon()
+    icon_path = Path(__file__).parent / "icon.ico"
+    icon_image = Image.open(icon_path)  
+
     _tray_icon = pystray.Icon(
-        APP_NAME,
+        "TgWsProxy",
         icon_image,
         "TG WS Proxy",
-        menu=_build_menu())
+        menu=_build_menu()
+    )
 
     log.info("Tray icon running")
     _tray_icon.run()
@@ -590,9 +535,16 @@ def run_tray():
 
 
 def main():
-    if not _acquire_lock():
+    if is_already_running():
         _show_info("Приложение уже запущено.", os.path.basename(sys.argv[0]))
         return
+
+    if getattr(sys, "frozen", False):
+        try:
+            ctypes.windll.user32.ShowWindow(
+                ctypes.windll.kernel32.GetConsoleWindow(), 0)
+        except Exception:
+            pass
 
     run_tray()
 

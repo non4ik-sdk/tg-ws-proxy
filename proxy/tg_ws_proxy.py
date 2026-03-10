@@ -10,7 +10,7 @@ import ssl
 import struct
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
@@ -71,10 +71,11 @@ _ssl_ctx.verify_mode = ssl.CERT_NONE
 
 class WsHandshakeError(Exception):
     def __init__(self, status_code: int, status_line: str,
-                 headers: dict = None, location: str = None):
+                 headers: Optional[Dict[str, Any]] = None,
+                 location: Optional[str] = None):
         self.status_code = status_code
         self.status_line = status_line
-        self.headers = headers or {}
+        self.headers: Dict[str, Any] = headers or {}
         self.location = location
         super().__init__(f"HTTP {status_code}: {status_line}")
 
@@ -298,11 +299,12 @@ class RawWebSocket:
 
 
 def _human_bytes(n: int) -> str:
+    value: float = float(n)
     for unit in ('B', 'KB', 'MB', 'GB'):
-        if abs(n) < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
+        if abs(value) < 1024:
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TB"
 
 
 def _is_telegram_ip(ip: str) -> bool:
@@ -559,7 +561,7 @@ async def _handle_client(reader, writer):
             return
         nmethods = hdr[1]
         await reader.readexactly(nmethods)
-        writer.write(b'\x05\x00')  # no-auth
+        writer.write(b'\x05\x00') 
         await writer.drain()
 
         # -- SOCKS5 CONNECT request --
@@ -588,15 +590,25 @@ async def _handle_client(reader, writer):
 
         port = struct.unpack('!H', await reader.readexactly(2))[0]
 
-        # -- Non-Telegram IP -> direct passthrough --
         if not _is_telegram_ip(dst):
             _stats.connections_passthrough += 1
             log.debug("[%s] passthrough -> %s:%d", label, dst, port)
-            try:
-                rr, rw = await asyncio.wait_for(
-                    asyncio.open_connection(dst, port), timeout=10)
-            except Exception as exc:
-                log.warning("[%s] passthrough failed to %s: %s: %s", label, dst, type(exc).__name__, str(exc) or "(no message)")
+
+            rr = rw = None
+
+            for family in (_socket.AF_INET6, _socket.AF_INET):
+                try:
+                    rr, rw = await asyncio.wait_for(
+                        asyncio.open_connection(dst, port, family=family),
+                        timeout=10
+                    )
+                    break
+                except Exception as exc:
+                    log.debug("[%s] passthrough failed to %s (family=%s): %s",
+                            label, dst, family, exc)
+
+            if rr is None or rw is None:
+                log.warning("[%s] passthrough all attempts failed to %s", label, dst)
                 writer.write(_socks5_reply(0x05))
                 await writer.drain()
                 writer.close()
@@ -606,9 +618,8 @@ async def _handle_client(reader, writer):
             await writer.drain()
 
             tasks = [asyncio.create_task(_pipe(reader, rw)),
-                     asyncio.create_task(_pipe(rr, writer))]
-            await asyncio.wait(tasks,
-                               return_when=asyncio.FIRST_COMPLETED)
+                    asyncio.create_task(_pipe(rr, writer))]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in tasks:
                 t.cancel()
             for t in tasks:
@@ -679,7 +690,7 @@ async def _handle_client(reader, writer):
 
         # -- Try WebSocket via direct connection --
         domains = _ws_domains(dc, is_media)
-        target = _dc_opt[dc]
+        target: str | None = _dc_opt[dc]
         ws = None
         ws_failed_redirect = False
         all_redirects = True
@@ -688,7 +699,11 @@ async def _handle_client(reader, writer):
             url = f'wss://{domain}/apiws'
             log.info("[%s] DC%d%s (%s:%d) -> %s via %s",
                      label, dc, media_tag, dst, port, url, target)
+            if target is None:
+                log.error("DC %d не имеет IP", dc)
+                continue 
             try:
+
                 ws = await RawWebSocket.connect(target, domain,
                                                 timeout=10)
                 all_redirects = False
@@ -774,26 +789,25 @@ _server_stop_event = None
 
 
 async def _run(port: int, dc_opt: Dict[int, Optional[str]],
-               stop_event: Optional[asyncio.Event] = None,
-               host: str = '127.0.0.1'):
+               stop_event: Optional[asyncio.Event] = None):
     global _dc_opt, _server_instance, _server_stop_event
     _dc_opt = dc_opt
     _server_stop_event = stop_event
 
     server = await asyncio.start_server(
-        _handle_client, host, port)
+        _handle_client, '127.0.0.1', port)
     _server_instance = server
 
     log.info("=" * 60)
     log.info("  Telegram WS Bridge Proxy")
-    log.info("  Listening on   %s:%d", host, port)
+    log.info("  Listening on   127.0.0.1:%d", port)
     log.info("  Target DC IPs:")
     for dc in dc_opt.keys():
         ip = dc_opt.get(dc)
         log.info("    DC%d: %s", dc, ip)
     log.info("=" * 60)
     log.info("  Configure Telegram Desktop:")
-    log.info("    SOCKS5 proxy -> %s:%d  (no user/pass)", host, port)
+    log.info("    SOCKS5 proxy -> 127.0.0.1:%d  (no user/pass)", port)
     log.info("=" * 60)
 
     async def log_stats():
@@ -845,10 +859,10 @@ def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:
 
 
 def run_proxy(port: int, dc_opt: Dict[int, str],
-              stop_event: Optional[asyncio.Event] = None,
-              host: str = '127.0.0.1'):
+              stop_event: Optional[asyncio.Event] = None):
     """Run the proxy (blocking). Can be called from threads."""
-    asyncio.run(_run(port, dc_opt, stop_event, host))
+    dc_opt_safe: Dict[int, Optional[str]] = {k: v for k, v in dc_opt.items()}
+    asyncio.run(_run(port, dc_opt_safe, stop_event))
 
 
 def main():
@@ -856,8 +870,6 @@ def main():
         description='Telegram Desktop WebSocket Bridge Proxy')
     ap.add_argument('--port', type=int, default=DEFAULT_PORT,
                     help=f'Listen port (default {DEFAULT_PORT})')
-    ap.add_argument('--host', type=str, default='127.0.0.1',
-                    help='Listen host (default 127.0.0.1)')
     ap.add_argument('--dc-ip', metavar='DC:IP', action='append',
                     default=['2:149.154.167.220', '4:149.154.167.220'],
                     help='Target IP for a DC, e.g. --dc-ip 1:149.154.175.205'
@@ -879,7 +891,8 @@ def main():
     )
 
     try:
-        asyncio.run(_run(args.port, dc_opt, host=args.host))
+        dc_opt_safe: Dict[int, Optional[str]] = {k: v for k, v in dc_opt.items()}
+        asyncio.run(_run(args.port, dc_opt_safe))
     except KeyboardInterrupt:
         log.info("Shutting down. Final stats: %s", _stats.summary())
 
